@@ -15,9 +15,10 @@ final class WpsBeanSerializer
 
     /**
      * Reads a record as stored: raw DB values (no HTML encoding) and dates in the DB format (UTC),
-     * independent of the current user's preferences. Null when the record does not exist / is deleted.
+     * independent of the current user's preferences. Null when the record does not exist / is deleted
+     * ($includeDeleted: a deleted record is returned too — used for the "delete" event).
      */
-    public static function load(string $module, string $id): ?SugarBean
+    public static function load(string $module, string $id, bool $includeDeleted = false): ?SugarBean
     {
         $bean = BeanFactory::newBean($module);
         if (!$bean instanceof SugarBean) {
@@ -26,7 +27,7 @@ final class WpsBeanSerializer
         $previous = $GLOBALS['disable_date_format'] ?? null;
         $GLOBALS['disable_date_format'] = true;
         try {
-            $found = $bean->retrieve($id, false);
+            $found = $bean->retrieve($id, false, !$includeDeleted);
         } finally {
             if ($previous === null) {
                 unset($GLOBALS['disable_date_format']);
@@ -38,12 +39,16 @@ final class WpsBeanSerializer
     }
 
     /**
+     * @param list<string>|null $only fields to include (null = all stored fields); id is always included
      * @return array<string, mixed> field => value (id is included)
      */
-    public static function toArray(SugarBean $bean): array
+    public static function toArray(SugarBean $bean, ?array $only = null): array
     {
         $result = [];
         foreach (self::storedFields($bean) as $name => $def) {
+            if ($only !== null && $name !== 'id' && !in_array($name, $only, true)) {
+                continue;
+            }
             $value = isset($bean->$name) ? $bean->$name : null;
             if (is_bool($value)) {
                 $value = $value ? '1' : '0';
@@ -54,7 +59,31 @@ final class WpsBeanSerializer
             }
             $result[$name] = $value;
         }
+        if (self::hasEmail($bean) && ($only === null || in_array('email1', $only, true))) {
+            $result['email1'] = self::primaryEmail($bean);
+        }
         return $result;
+    }
+
+    /**
+     * People and companies keep e-mail addresses in a separate table; "email1" (the primary address) is read and
+     * written like a field (WPS send_email, md/tasks_list/done/4.1-send-email.md).
+     */
+    public static function hasEmail(SugarBean $bean): bool
+    {
+        return isset($bean->field_defs['email1']) && property_exists($bean, 'emailAddress') && $bean->emailAddress !== null;
+    }
+
+    public static function primaryEmail(SugarBean $bean): string
+    {
+        if (empty($bean->id)) {
+            return (string)($bean->email1 ?? '');
+        }
+        try {
+            return (string)$bean->emailAddress->getPrimaryAddress($bean);
+        } catch (Throwable $e) {
+            return (string)($bean->email1 ?? '');
+        }
     }
 
     /**
@@ -69,6 +98,14 @@ final class WpsBeanSerializer
         $ignored = [];
         foreach ($attributes as $name => $value) {
             $name = (string)$name;
+            if ($name === 'email1' && self::hasEmail($bean) && ($value === null || is_scalar($value))) {
+                // saved by SugarBean (SugarEmailAddress::handleLegacySave) as the primary address
+                $bean->email1 = $value === null ? '' : trim((string)$value);
+                // a retrieved record has its addresses loaded and SugarEmailAddress would ignore email1:
+                // rebuild them from email1..email10 on save
+                $bean->emailAddress->addresses = [];
+                continue;
+            }
             if (!isset($fields[$name]) || in_array($name, ['id', 'deleted', 'date_entered', 'date_modified', 'created_by'], true)) {
                 $ignored[] = $name;
                 continue;
@@ -86,7 +123,9 @@ final class WpsBeanSerializer
             } elseif ($value !== null && $value !== '' && $type === 'date') {
                 $value = self::toDbDate((string)$value);
             }
-            $bean->$name = $value === null ? null : (string)$value;
+            // null clears the field: SugarBean::save() skips properties that are null (isset), '' is stored as
+            // empty / NULL depending on the field type
+            $bean->$name = $value === null ? '' : (string)$value;
         }
         return $ignored;
     }

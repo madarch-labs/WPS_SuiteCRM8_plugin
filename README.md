@@ -44,8 +44,8 @@ The plugin connects the CRM and WPS in both directions:
 
 | Direction | How it works |
 |---|---|
-| CRM → WPS | Application-level `after_save` logic hook (`WpsEventHook`) publishes the saved record to the WPS Redis Stream: `XADD crm_events MAXLEN ~ 100000 * data '{json}'`. The Redis client is written in pure PHP (`WpsRedisClient`); the phpredis extension is not required |
-| WPS → CRM | Custom entry point `wpsApi` (`WpsApi`) serves the API with the WPS contract: `GET/POST/PUT /api/v9/{module}[/{id}]`, search `?filter[field]=value&size=1`, module dictionary `/api/v9/modules`. The `/api/v9/...` path is translated to the entry point by a web server rewrite rule |
+| CRM → WPS | Application-level logic hooks of `WpsEventHook` publish events of the WPS contract 2.0 to the WPS Redis Stream (`XADD crm_events MAXLEN ~ 100000 * data '{json}'`): `before_save` remembers the stored row, `after_save` publishes `create` / `update` with `before` (old values of the changed fields) and `changed_fields`, `after_delete` publishes `delete`; relationship hooks publish `link` / `unlink` when enabled. The Redis client is written in pure PHP (`WpsRedisClient`); the phpredis extension is not required |
+| WPS → CRM | Custom entry point `wpsApi` (`WpsApi`) serves the API of the WPS contract 2.0: `GET /api/v9/capabilities`, `GET/POST/PUT/DELETE /api/v9/{module}[/{id}]`, search with filter operators, sort, cursor pages, `fields` and `count`, relationships `/api/v9/{module}/{id}/relationships/{link}` with link fields, dictionary `/api/v9/modules`. The `/api/v9/...` path is translated to the entry point by a web server rewrite rule |
 | Marker | Field `Leads.wps_processed_c` ("Processed by WPS"), set by WPS processes |
 
 The SuiteCRM core is not modified: files are installed into `custom/` via the Extension framework, the package is
@@ -156,7 +156,7 @@ All options: `bin/install.sh --help` (`--web-user`, `--skip-config`, `--skip-che
 
 ### 4.3. Manually via Admin → Module Loader
 
-1. Build the zip: `bin/build.sh` → `dist/wps_integration-1.1.0-suitecrm8.zip` (`manifest.php` at the archive root;
+1. Build the zip: `bin/build.sh` → `dist/wps_integration-1.2.0-suitecrm8.zip` (`manifest.php` at the archive root;
    requires `zip` or PHP CLI with `ext-zip`).
 2. Log in to the CRM as an administrator, open **Admin → Module Loader** (user menu → Admin; the legacy page opens
    inside the new interface at `#/administration/UpgradeWizard?view=module`).
@@ -226,6 +226,13 @@ Written to `$sugar_config['wps']` (`config_override.php`) by `wps_setup.php conf
 | `WPS_API_STATIC_KEY` | `api_static_key` | empty | API key: `X-Auth-Key = key . gmdate("Y.m.d H")`, the previous hour's key is also accepted. An empty key — the API responds 401 to everything |
 | `WPS_API_USER_ID` | `api_user_id` | `1` | the CRM user the API acts as (`created_by`, `modified_user_id`) |
 | — | `api_readonly_modules` | `Users, Employees` | modules that cannot be written to (405) |
+| `WPS_IGNORE_CHANGE_FIELDS` | `ignore_change_fields` | `date_modified,modified_user_id,date_entered,created_by,deleted` | fields never reported as changed (`before`, `changed_fields`) |
+| `WPS_PUBLISH_UNCHANGED` | `publish_unchanged` | `true` | publish `update` events without changed fields |
+| `WPS_PUBLISH_DELETE_EVENTS` | `publish_delete_events` | `true` | `after_delete` → event `delete` |
+| `WPS_PUBLISH_RELATIONSHIP_EVENTS` | `publish_relationship_events` | `false` | `after_relationship_add/delete` → events `link` / `unlink` (WPS ignores them for now) |
+| `WPS_MAX_PAGE_SIZE` | `max_page_size` | `100` | maximum `page[size]` of the search and of relationship lists |
+| `WPS_MAX_LINK_BATCH` | `max_link_batch` | `100` | maximum items of one `POST …/relationships/{link}` |
+| `WPS_MAX_IN_VALUES` | `max_in_values` | `100` | maximum values of the `in` operator |
 
 To change parameters without reinstalling: `bin/install.sh … --skip-check` or `wps_setup.php config` from
 `public/legacy`.
@@ -244,6 +251,13 @@ curl -s -g -H "X-Auth-Key: $KEY" "http://<crm>/api/v9/Leads?filter[status]=New&s
 
 # 3. event: save any lead in the CRM and look at the tail of the stream in the WPS Redis
 redis-cli -h <redis-wps> XREVRANGE crm_events + - COUNT 1
+```
+
+Full check of contract 2.0 (creates records, checks search operators, the cursor, `fields`, `count`, `422` errors, v2 events in
+the stream, `DELETE`, relationships with link fields; prints `ALL OK`):
+
+```bash
+bin/contract_check.sh http://<crm>/api/v9 "$WPS_API_STATIC_KEY" <container of the WPS redis-stream>
 ```
 
 ## 8. Connecting WPS to this CRM
@@ -325,6 +339,23 @@ Errors: `{errors: [{status, title, detail?}]}` — `400` (broken JSON), `401` (k
 in `Users`/`Employees`), `422`, `500`. Unknown and system attributes are not written; their list is in
 `meta.ignored_attributes`. Dates are accepted as `Y-m-d H:i:s` (UTC) or ISO 8601.
 
+**Contract 2.0** (since 1.2.0; the normative description is in WPS `doc/en/04-operations/crm-integration.md`):
+
+- events: `event_type` (`create` / `update` / `delete`), `before` — old values of the changed fields only (`{}` for create and
+  delete), `changed_fields` (for create — all filled fields; `ignore_change_fields` are never listed), `wps_event_version: 2`,
+  `wps_origin` — `{execution_id, process_id, depth}` from the `X-WPS-*` headers when the save was made by WPS (also for cascade
+  saves in the same request). Changes are detected after normalization by the field type (`1000.000000` = `1000`, `NULL` = `''`,
+  multienum order); a save with `deleted = 1` is published as `delete`;
+- `GET /api/v9/capabilities` → `{data: {contract_version: "2.0", crm, features, limits}}`;
+- search: `filter[f][op]=v` (`eq neq gt gte lt lte like in nin null notnull`, AND), `sort` (up to 2 fields, `-` = descending, a hidden
+  `id` key), `page[size]` (≤ `max_page_size`), cursor `page[after]` / `meta.next_cursor`, `fields`, `count=1` → `meta.total`;
+  a cursor of another query → `422`;
+- `DELETE /api/v9/{module}/{id}` → `{meta: {deleted: true}}` (soft delete), `404` if missing;
+- `GET|POST /api/v9/{module}/{id}/relationships/{link}`, `DELETE …/{related_id}`: related records with `meta.relationship`
+  (columns of the join table, e.g. `accept_status`, `required`); `POST {data: [{type, id, meta: {...}}]}` →
+  `{meta: {linked, updated, not_found}}` (idempotent, updates the link fields); `DELETE` → `{meta: {removed}}`.
+  Read-only modules allow `GET` of relationships.
+
 ---
 
 <a id="russian"></a>
@@ -366,8 +397,8 @@ in `Users`/`Employees`), `422`, `500`. Unknown and system attributes are not wri
 
 | Направление | Как сделано |
 |---|---|
-| CRM → WPS | logic hook `after_save` уровня приложения (`WpsEventHook`) публикует сохранённую запись в Redis Stream WPS: `XADD crm_events MAXLEN ~ 100000 * data '{json}'`. Клиент Redis написан на чистом PHP (`WpsRedisClient`), расширение phpredis не нужно |
-| WPS → CRM | custom entry point `wpsApi` (`WpsApi`) отдаёт API с контрактом WPS: `GET/POST/PUT /api/v9/{module}[/{id}]`, поиск `?filter[field]=value&size=1`, справочник `/api/v9/modules`. Путь `/api/v9/...` переводится на entry point правилом rewrite веб-сервера |
+| CRM → WPS | logic hooks уровня приложения `WpsEventHook` публикуют события контракта WPS 2.0 в Redis Stream WPS (`XADD crm_events MAXLEN ~ 100000 * data '{json}'`): `before_save` запоминает сохранённую строку, `after_save` публикует `create` / `update` с `before` (старые значения изменённых полей) и `changed_fields`, `after_delete` — `delete`; хуки связей по настройке публикуют `link` / `unlink`. Клиент Redis написан на чистом PHP (`WpsRedisClient`), расширение phpredis не нужно |
+| WPS → CRM | custom entry point `wpsApi` (`WpsApi`) отдаёт API контракта WPS 2.0: `GET /api/v9/capabilities`, `GET/POST/PUT/DELETE /api/v9/{module}[/{id}]`, поиск с операторами фильтра, сортировкой, курсорными страницами, `fields` и `count`, связи `/api/v9/{module}/{id}/relationships/{link}` с полями связи, справочник `/api/v9/modules`. Путь `/api/v9/...` переводится на entry point правилом rewrite веб-сервера |
 | Маркер | поле `Leads.wps_processed_c` («Обработан WPS»), его ставят процессы WPS |
 
 Ядро SuiteCRM не изменяется: файлы ставятся в `custom/` через Extension-фреймворк, пакет виден в
@@ -470,7 +501,7 @@ cp config/wps.env.example config/wps.env
 
 ### 4.3. Вручную через Admin → Module Loader
 
-1. Соберите zip: `bin/build.sh` → `dist/wps_integration-1.1.0-suitecrm8.zip` (`manifest.php` в корне архива;
+1. Соберите zip: `bin/build.sh` → `dist/wps_integration-1.2.0-suitecrm8.zip` (`manifest.php` в корне архива;
    нужен `zip` или PHP CLI с `ext-zip`).
 2. Войдите в CRM администратором, откройте **Admin → Module Loader** (меню пользователя → Admin; страница legacy
    открывается внутри нового интерфейса по адресу `#/administration/UpgradeWizard?view=module`).
@@ -537,6 +568,13 @@ Entry point вызывается как `/legacy/index.php?entryPoint=wpsApi&wps
 | `WPS_API_STATIC_KEY` | `api_static_key` | пусто | ключ API: `X-Auth-Key = ключ . gmdate("Y.m.d H")`, принимается и ключ прошлого часа. Пустой ключ — API отвечает 401 на всё |
 | `WPS_API_USER_ID` | `api_user_id` | `1` | пользователь CRM, от имени которого работает API (`created_by`, `modified_user_id`) |
 | — | `api_readonly_modules` | `Users, Employees` | модули, запись в которые запрещена (405) |
+| `WPS_IGNORE_CHANGE_FIELDS` | `ignore_change_fields` | `date_modified,modified_user_id,date_entered,created_by,deleted` | поля, которые не считаются изменениями (`before`, `changed_fields`) |
+| `WPS_PUBLISH_UNCHANGED` | `publish_unchanged` | `true` | публиковать `update` без изменённых полей |
+| `WPS_PUBLISH_DELETE_EVENTS` | `publish_delete_events` | `true` | `after_delete` → событие `delete` |
+| `WPS_PUBLISH_RELATIONSHIP_EVENTS` | `publish_relationship_events` | `false` | `after_relationship_add/delete` → события `link` / `unlink` (WPS их пока не обрабатывает) |
+| `WPS_MAX_PAGE_SIZE` | `max_page_size` | `100` | максимальный `page[size]` поиска и списка связей |
+| `WPS_MAX_LINK_BATCH` | `max_link_batch` | `100` | максимум элементов одного `POST …/relationships/{link}` |
+| `WPS_MAX_IN_VALUES` | `max_in_values` | `100` | максимум значений оператора `in` |
 
 Изменить параметры без переустановки: `bin/install.sh … --skip-check` или `wps_setup.php config` из `public/legacy`.
 
@@ -554,6 +592,13 @@ curl -s -g -H "X-Auth-Key: $KEY" "http://<crm>/api/v9/Leads?filter[status]=New&s
 
 # 3. событие: сохраните любой лид в CRM и посмотрите хвост стрима в Redis WPS
 redis-cli -h <redis-wps> XREVRANGE crm_events + - COUNT 1
+```
+
+Полная проверка контракта 2.0 (создаёт записи, проверяет операторы поиска, курсор, `fields`, `count`, ошибки `422`, события v2 в
+стриме, `DELETE`, связи с полями связи; печатает `ALL OK`):
+
+```bash
+bin/contract_check.sh http://<crm>/api/v9 "$WPS_API_STATIC_KEY" <контейнер redis-stream WPS>
 ```
 
 ## 8. Подключение WPS к этой CRM
@@ -632,3 +677,20 @@ bin/uninstall.sh --docker <контейнер> [те же опции]
 Ошибки: `{errors: [{status, title, detail?}]}` — `400` (битый JSON), `401` (ключ), `404`, `405` (метод или запись в
 `Users`/`Employees`), `422`, `500`. Неизвестные и системные атрибуты не записываются, их список — в
 `meta.ignored_attributes`. Даты принимаются как `Y-m-d H:i:s` (UTC) или ISO 8601.
+
+**Контракт 2.0** (с версии 1.2.0; нормативное описание — в WPS `doc/ru/04-operations/crm-integration.md`):
+
+- события: `event_type` (`create` / `update` / `delete`), `before` — старые значения только изменённых полей (`{}` для создания и
+  удаления), `changed_fields` (для создания — все заполненные поля; `ignore_change_fields` не попадают), `wps_event_version: 2`,
+  `wps_origin` — `{execution_id, process_id, depth}` из заголовков `X-WPS-*`, если сохранение сделал WPS (в том числе для каскадных
+  сохранений в том же запросе). Изменения считаются после нормализации по типу поля (`1000.000000` = `1000`, `NULL` = `''`,
+  порядок multienum); сохранение с `deleted = 1` публикуется как `delete`;
+- `GET /api/v9/capabilities` → `{data: {contract_version: "2.0", crm, features, limits}}`;
+- поиск: `filter[f][op]=v` (`eq neq gt gte lt lte like in nin null notnull`, по И), `sort` (до 2 полей, `-` — по убыванию, скрытый
+  ключ `id`), `page[size]` (≤ `max_page_size`), курсор `page[after]` / `meta.next_cursor`, `fields`, `count=1` → `meta.total`;
+  курсор другого запроса → `422`;
+- `DELETE /api/v9/{module}/{id}` → `{meta: {deleted: true}}` (мягкое удаление), `404`, если записи нет;
+- `GET|POST /api/v9/{module}/{id}/relationships/{link}`, `DELETE …/{related_id}`: связанные записи с `meta.relationship`
+  (колонки join-таблицы, например `accept_status`, `required`); `POST {data: [{type, id, meta: {...}}]}` →
+  `{meta: {linked, updated, not_found}}` (идемпотентно, обновляет поля связи); `DELETE` → `{meta: {removed}}`.
+  Модули только для чтения разрешают `GET` связей.

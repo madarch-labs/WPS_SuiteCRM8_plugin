@@ -18,10 +18,19 @@ if (!defined('sugarEntry') || !sugarEntry) {
  *     'api_static_key'   => '...',             // X-Auth-Key = key . gmdate('Y.m.d H')
  *     'api_user_id'      => '1',               // user the API acts as (created_by / modified_user_id)
  *     'api_readonly_modules' => ['Users', 'Employees'],
+ *     // contract 2.0
+ *     'ignore_change_fields' => ['date_modified', ...], // never reported as changed (event "before" / "changed_fields")
+ *     'publish_unchanged'    => true,              // publish "update" events without changed fields
+ *     'publish_delete_events' => true,             // after_delete → event "delete"
+ *     'publish_relationship_events' => false,      // after_relationship_add/delete → events "link" / "unlink"
+ *     'max_page_size' => 100, 'max_link_batch' => 100, 'max_in_values' => 100,
  *   ]
  */
 final class WpsConfig
 {
+    public const PLUGIN_VERSION = '1.2.0';
+    public const CONTRACT_VERSION = '2.0';
+
     private const DEFAULTS = [
         'enabled' => true,
         'redis_host' => '127.0.0.1',
@@ -34,6 +43,14 @@ final class WpsConfig
         'api_static_key' => '',
         'api_user_id' => '1',
         'api_readonly_modules' => ['Users', 'Employees'],
+        // contract 2.0: events v2, search and relationship limits
+        'ignore_change_fields' => ['date_modified', 'modified_user_id', 'date_entered', 'created_by', 'deleted'],
+        'publish_unchanged' => true,
+        'publish_delete_events' => true,
+        'publish_relationship_events' => false,
+        'max_page_size' => 100,
+        'max_link_batch' => 100,
+        'max_in_values' => 100,
     ];
 
     /**
@@ -60,6 +77,11 @@ final class WpsConfig
             return [];
         }
         return array_values(array_filter(array_map('trim', array_map('strval', $value)), 'strlen'));
+    }
+
+    public static function flag(string $key): bool
+    {
+        return filter_var(self::get($key), FILTER_VALIDATE_BOOLEAN);
     }
 
     public static function enabled(): bool

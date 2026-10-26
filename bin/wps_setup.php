@@ -14,7 +14,9 @@
  *   php wps_setup.php status                        what is installed and whether Redis is reachable (exit code 1 if not installed)
  *
  * Env (config): WPS_ENABLED, WPS_REDIS_HOST, WPS_REDIS_PORT, WPS_REDIS_PASSWORD, WPS_REDIS_TIMEOUT, WPS_REDIS_STREAM,
- *               WPS_REDIS_STREAM_MAXLEN, WPS_EVENT_MODULES (comma list, empty = all), WPS_API_STATIC_KEY, WPS_API_USER_ID.
+ *               WPS_REDIS_STREAM_MAXLEN, WPS_EVENT_MODULES (comma list, empty = all), WPS_API_STATIC_KEY, WPS_API_USER_ID;
+ *               contract 2.0 (optional): WPS_IGNORE_CHANGE_FIELDS (comma list), WPS_PUBLISH_UNCHANGED, WPS_PUBLISH_DELETE_EVENTS,
+ *               WPS_PUBLISH_RELATIONSHIP_EVENTS, WPS_MAX_PAGE_SIZE, WPS_MAX_LINK_BATCH, WPS_MAX_IN_VALUES.
  */
 
 if (PHP_SAPI !== 'cli') {
@@ -104,6 +106,14 @@ function wps_configure(): void
         'event_modules' => $modules,
         'api_static_key' => $key,
         'api_user_id' => wps_env('WPS_API_USER_ID', '1'),
+        // contract 2.0: events v2 and API limits
+        'ignore_change_fields' => array_values(array_filter(array_map('trim', explode(',', wps_env('WPS_IGNORE_CHANGE_FIELDS', 'date_modified,modified_user_id,date_entered,created_by,deleted'))), 'strlen')),
+        'publish_unchanged' => filter_var(wps_env('WPS_PUBLISH_UNCHANGED', 'true'), FILTER_VALIDATE_BOOLEAN),
+        'publish_delete_events' => filter_var(wps_env('WPS_PUBLISH_DELETE_EVENTS', 'true'), FILTER_VALIDATE_BOOLEAN),
+        'publish_relationship_events' => filter_var(wps_env('WPS_PUBLISH_RELATIONSHIP_EVENTS', 'false'), FILTER_VALIDATE_BOOLEAN),
+        'max_page_size' => (int)wps_env('WPS_MAX_PAGE_SIZE', '100'),
+        'max_link_batch' => (int)wps_env('WPS_MAX_LINK_BATCH', '100'),
+        'max_in_values' => (int)wps_env('WPS_MAX_IN_VALUES', '100'),
         'api_readonly_modules' => ['Users', 'Employees'],
     ];
     $configurator->handleOverride();
